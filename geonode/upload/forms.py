@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,6 +17,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
 import os
 import files
 import tempfile
@@ -31,6 +33,7 @@ class UploadFileForm(forms.ModelForm):
 
     class Meta:
         model = UploadFile
+        fields = '__all__'
 
 
 class LayerUploadForm(forms.Form):
@@ -38,31 +41,56 @@ class LayerUploadForm(forms.Form):
     dbf_file = forms.FileField(required=False)
     shx_file = forms.FileField(required=False)
     prj_file = forms.FileField(required=False)
-    sld_file = forms.FileField(required=False)
     xml_file = forms.FileField(required=False)
 
-    geogit = forms.BooleanField(required=False)
-    geogit_store = forms.CharField(required=False)
+    if 'geonode.geoserver' in settings.INSTALLED_APPS:
+        sld_file = forms.FileField(required=False)
+    if 'geonode_qgis_server' in settings.INSTALLED_APPS:
+        qml_file = forms.FileField(required=False)
+
+    geogig = forms.BooleanField(required=False)
+    geogig_store = forms.CharField(required=False)
     time = forms.BooleanField(required=False)
+
+    mosaic = forms.BooleanField(required=False)
+    append_to_mosaic_opts = forms.BooleanField(required=False)
+    append_to_mosaic_name = forms.CharField(required=False)
+    mosaic_time_regex = forms.CharField(required=False)
+    mosaic_time_value = forms.CharField(required=False)
+    time_presentation = forms.CharField(required=False)
+    time_presentation_res = forms.IntegerField(required=False)
+    time_presentation_default_value = forms.CharField(required=False)
+    time_presentation_reference_value = forms.CharField(required=False)
 
     abstract = forms.CharField(required=False)
     layer_title = forms.CharField(required=False)
     permissions = JSONField()
 
-    spatial_files = (
+    metadata_uploaded_preserve = forms.BooleanField(required=False)
+
+    spatial_files = [
         "base_file",
         "dbf_file",
         "shx_file",
         "prj_file",
-        "sld_file",
-        "xml_file")
+        "xml_file",
+    ]
+    # Adding style file based on the backend
+    if 'geonode.geoserver' in settings.INSTALLED_APPS:
+        spatial_files.append('sld_file')
+    if 'geonode_qgis_server' in settings.INSTALLED_APPS:
+        spatial_files.append('qml_file')
+
+    spatial_files = tuple(spatial_files)
 
     def clean(self):
         requires_datastore = () if ogc_server_settings.DATASTORE else (
             '.csv',
             '.kml')
         types = [t for t in files.types if t.code not in requires_datastore]
-        supported_type = lambda ext: any([t.matches(ext) for t in types])
+
+        def supported_type(ext):
+            return any([t.matches(ext) for t in types])
 
         cleaned = super(LayerUploadForm, self).clean()
         base_name, base_ext = os.path.splitext(cleaned["base_file"].name)

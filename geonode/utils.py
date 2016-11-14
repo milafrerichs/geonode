@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,20 +18,31 @@
 #
 #########################################################################
 
-import httplib2
 import base64
-import math
 import copy
+import datetime
+import logging
+import math
+import os
+import re
 import string
 
 from django.conf import settings
-from django.core.exceptions import PermissionDenied
-from django.utils.translation import ugettext_lazy as _
-from django.shortcuts import get_object_or_404
-from django.utils import simplejson as json
-from django.http import HttpResponse
 from django.core.cache import cache
+from django.core.exceptions import PermissionDenied
 from django.http import Http404
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+from django.utils.translation import ugettext_lazy as _
+import httplib2
+from osgeo import ogr
+from slugify import Slugify
+
+
+try:
+    import json
+except ImportError:
+    from django.utils import simplejson as json
 
 DEFAULT_TITLE = ""
 DEFAULT_ABSTRACT = ""
@@ -44,6 +56,10 @@ BASE = len(ALPHABET)
 SIGN_CHARACTER = '$'
 
 http_client = httplib2.Http()
+
+custom_slugify = Slugify(separator='_')
+
+logger = logging.getLogger("geonode.utils")
 
 
 def _get_basic_auth_info(request):
@@ -250,7 +266,7 @@ class GXPMapBase(object):
                        for source in sources.values() if 'url' in source]
 
         if 'geonode.geoserver' in settings.INSTALLED_APPS:
-            if not settings.MAP_BASELAYERS[0]['source']['url'] in source_urls:
+            if len(sources.keys()) > 0 and not settings.MAP_BASELAYERS[0]['source']['url'] in source_urls:
                 keys = sorted(sources.keys())
                 settings.MAP_BASELAYERS[0]['source'][
                     'title'] = 'Local Geoserver'
@@ -269,8 +285,23 @@ class GXPMapBase(object):
                     lyr["source"]) not in map(
                     _base_source,
                     sources.values()):
-                sources[
-                    str(int(max(sources.keys(), key=int)) + 1)] = lyr["source"]
+                if len(sources.keys()) > 0:
+                    sources[
+                        str(int(max(sources.keys(), key=int)) + 1)] = lyr["source"]
+
+        # adding remote services sources
+        from geonode.services.models import Service
+        index = int(max(sources.keys())) if len(sources.keys()) > 0 else 0
+        for service in Service.objects.all():
+            remote_source = {
+                'url': service.base_url,
+                'remote': True,
+                'ptype': 'gxp_wmscsource',
+                'name': service.name
+            }
+            if remote_source['url'] not in source_urls:
+                index += 1
+                sources[index] = remote_source
 
         config = {
             'id': self.id,
@@ -291,6 +322,10 @@ class GXPMapBase(object):
         if any(layers):
             # Mark the last added layer as selected - important for data page
             config["map"]["layers"][len(layers) - 1]["selected"] = True
+        else:
+            (def_map_config, def_map_layers) = default_map_config()
+            config = def_map_config
+            layers = def_map_layers
 
         config["map"].update(_get_viewer_projection_info(self.projection))
 
@@ -394,12 +429,15 @@ class GXPLayer(GXPLayerBase):
 
 
 def default_map_config():
-    _DEFAULT_MAP_CENTER = forward_mercator(settings.DEFAULT_MAP_CENTER)
+    if getattr(settings, 'DEFAULT_MAP_CRS', 'EPSG:900913') == "EPSG:4326":
+        _DEFAULT_MAP_CENTER = inverse_mercator(settings.DEFAULT_MAP_CENTER)
+    else:
+        _DEFAULT_MAP_CENTER = forward_mercator(settings.DEFAULT_MAP_CENTER)
 
     _default_map = GXPMap(
         title=DEFAULT_TITLE,
         abstract=DEFAULT_ABSTRACT,
-        projection="EPSG:900913",
+        projection=getattr(settings, 'DEFAULT_MAP_CRS', 'EPSG:900913'),
         center_x=_DEFAULT_MAP_CENTER[0],
         center_y=_DEFAULT_MAP_CENTER[1],
         zoom=settings.DEFAULT_MAP_ZOOM
@@ -539,3 +577,206 @@ def num_decode(s):
     for c in s:
         n = n * BASE + ALPHABET_REVERSE[c]
     return n
+
+
+def format_urls(a, values):
+    b = []
+    for i in a:
+        j = i.copy()
+        try:
+            j['url'] = unicode(j['url']).format(**values)
+        except KeyError:
+            j['url'] = None
+        b.append(j)
+    return b
+
+
+def build_abstract(resourcebase, url=None, includeURL=True):
+    if resourcebase.abstract and url and includeURL:
+        return u"{abstract} -- [{url}]({url})".format(abstract=resourcebase.abstract, url=url)
+    else:
+        return resourcebase.abstract
+
+
+def build_caveats(resourcebase):
+    caveats = []
+    if resourcebase.maintenance_frequency:
+        caveats.append(resourcebase.maintenance_frequency_title())
+    if resourcebase.license:
+        caveats.append(resourcebase.license_verbose)
+    if resourcebase.data_quality_statement:
+        caveats.append(resourcebase.data_quality_statement)
+    if len(caveats) > 0:
+        return u"- " + u"%0A- ".join(caveats)
+    else:
+        return u""
+
+
+def build_social_links(request, resourcebase):
+    social_url = u"{protocol}://{host}{path}".format(
+        protocol=("https" if request.is_secure() else "http"),
+        host=request.get_host(),
+        path=request.get_full_path())
+    # Don't use datetime strftime() because it requires year >= 1900
+    # see https://docs.python.org/2/library/datetime.html#strftime-strptime-behavior
+    date = '{0.month:02d}/{0.day:02d}/{0.year:4d}'.format(resourcebase.date) if resourcebase.date else None
+    abstract = build_abstract(resourcebase, url=social_url, includeURL=True)
+    caveats = build_caveats(resourcebase)
+    hashtags = ",".join(getattr(settings, 'TWITTER_HASHTAGS', []))
+    return format_urls(
+        settings.SOCIAL_ORIGINS,
+        {
+            'name': resourcebase.title,
+            'date': date,
+            'abstract': abstract,
+            'caveats': caveats,
+            'hashtags': hashtags,
+            'url': social_url})
+
+
+def check_shp_columnnames(layer):
+    """ Check if shapefile for a given layer has valid column names.
+        If not, try to fix column names and warn the user
+    """
+
+    # TODO we may add in a better location this method
+    inShapefile = ''
+    for f in layer.upload_session.layerfile_set.all():
+        if os.path.splitext(f.file.name)[1] == '.shp':
+            inShapefile = f.file.path
+
+    inDriver = ogr.GetDriverByName('ESRI Shapefile')
+    inDataSource = inDriver.Open(inShapefile, 1)
+    if inDataSource is None:
+        print 'Could not open %s' % (inShapefile)
+        return False, None, None
+    else:
+        inLayer = inDataSource.GetLayer()
+
+    # TODO we may need to improve this regexp
+    # first character must be any letter or "_"
+    # following characters can be any letter, number, "#", ":"
+    regex = r'^[a-zA-Z,_][a-zA-Z,_,#,:\d]*$'
+    a = re.compile(regex)
+    regex_first_char = r'[a-zA-Z,_]{1}'
+    b = re.compile(regex_first_char)
+    inLayerDefn = inLayer.GetLayerDefn()
+
+    list_col_original = []
+    list_col = {}
+
+    for i in range(0, inLayerDefn.GetFieldCount()):
+        field_name = inLayerDefn.GetFieldDefn(i).GetName()
+
+        if a.match(field_name):
+            list_col_original.append(field_name)
+    try:
+        for i in range(0, inLayerDefn.GetFieldCount()):
+            field_name = unicode(inLayerDefn.GetFieldDefn(i).GetName(), layer.charset)
+
+            if not a.match(field_name):
+                new_field_name = custom_slugify(field_name)
+
+                if not b.match(new_field_name):
+                    new_field_name = '_' + new_field_name
+                j = 0
+                while new_field_name in list_col_original or new_field_name in list_col.values():
+                    if j == 0:
+                        new_field_name += '_0'
+                    if new_field_name.endswith('_' + str(j)):
+                        j += 1
+                        new_field_name = new_field_name[:-2] + '_' + str(j)
+                list_col.update({field_name: new_field_name})
+    except UnicodeDecodeError as e:
+        print str(e)
+        return False, None, None
+
+    if len(list_col) == 0:
+        return True, None, None
+    else:
+        for key in list_col.keys():
+            qry = u"ALTER TABLE {0} RENAME COLUMN \"{1}\" TO \"{2}\"".format(inLayer.GetName(), key, list_col[key])
+            inDataSource.ExecuteSQL(qry.encode(layer.charset))
+    return True, None, list_col
+
+
+def set_attributes(layer, attribute_map, overwrite=False, attribute_stats=None):
+    """ *layer*: a geonode.layers.models.Layer instance
+        *attribute_map*: a list of 2-lists specifying attribute names and types,
+            example: [ ['id', 'Integer'], ... ]
+        *overwrite*: replace existing attributes with new values if name/type matches.
+        *attribute_stats*: dictionary of return values from get_attribute_statistics(),
+            of the form to get values by referencing attribute_stats[<layer_name>][<field_name>].
+    """
+    # Some import dependency tweaking; functions in this module are used before
+    # models are fully set up so Attribute has to be imported here.
+    from geonode.layers.models import Attribute
+
+    # we need 3 more items; description, attribute_label, and display_order
+    attribute_map_dict = {
+        'field': 0,
+        'ftype': 1,
+        'description': 2,
+        'label': 3,
+        'display_order': 4,
+    }
+    for attribute in attribute_map:
+        attribute.extend((None, None, 0))
+
+    attributes = layer.attribute_set.all()
+    # Delete existing attributes if they no longer exist in an updated layer
+    for la in attributes:
+        lafound = False
+        for attribute in attribute_map:
+            field, ftype, description, label, display_order = attribute
+            if field == la.attribute:
+                lafound = True
+                # store description and attribute_label in attribute_map
+                attribute[attribute_map_dict['description']] = la.description
+                attribute[attribute_map_dict['label']] = la.attribute_label
+                attribute[attribute_map_dict['display_order']] = la.display_order
+        if overwrite or not lafound:
+            logger.debug(
+                "Going to delete [%s] for [%s]",
+                la.attribute,
+                layer.name.encode('utf-8'))
+            la.delete()
+
+    # Add new layer attributes if they don't already exist
+    if attribute_map is not None:
+        iter = len(Attribute.objects.filter(layer=layer)) + 1
+        for attribute in attribute_map:
+            field, ftype, description, label, display_order = attribute
+            if field is not None:
+                la, created = Attribute.objects.get_or_create(
+                    layer=layer, attribute=field, attribute_type=ftype,
+                    description=description, attribute_label=label,
+                    display_order=display_order)
+                if created:
+                    if (not attribute_stats or layer.name not in attribute_stats or
+                            field not in attribute_stats[layer.name]):
+                        result = None
+                    else:
+                        result = attribute_stats[layer.name][field]
+
+                    if result is not None:
+                        logger.debug("Generating layer attribute statistics")
+                        la.count = result['Count']
+                        la.min = result['Min']
+                        la.max = result['Max']
+                        la.average = result['Average']
+                        la.median = result['Median']
+                        la.stddev = result['StandardDeviation']
+                        la.sum = result['Sum']
+                        la.unique_values = result['unique_values']
+                        la.last_stats_updated = datetime.datetime.now()
+                    la.visible = ftype.find("gml:") != 0
+                    la.display_order = iter
+                    la.save()
+                    iter += 1
+                    logger.debug(
+                        "Created [%s] attribute for [%s]",
+                        field,
+                        layer.name.encode('utf-8'))
+    else:
+        logger.debug("No attributes found")

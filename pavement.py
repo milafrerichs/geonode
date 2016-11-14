@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,7 +28,10 @@ import urllib2
 import zipfile
 import glob
 import fileinput
+import yaml
+
 from setuptools.command import easy_install
+from urlparse import urlparse
 
 from paver.easy import task, options, cmdopts, needs
 from paver.easy import path, sh, info, call_task
@@ -36,7 +40,7 @@ from paver.easy import BuildFailure
 try:
     from geonode.settings import GEONODE_APPS
 except:
-    #probably trying to run install_win_deps.
+    # probably trying to run install_win_deps.
     pass
 
 try:
@@ -46,6 +50,10 @@ except ImportError:
 
 assert sys.version_info >= (2, 6), \
     SystemError("GeoNode Build requires python 2.6 or better")
+
+dev_config = None
+with open("dev_config.yml", 'r') as f:
+    dev_config = yaml.load(f)
 
 
 def grab(src, dest, name):
@@ -57,14 +65,22 @@ def grab(src, dest, name):
     else:
         download = False
     if download:
-        urllib.urlretrieve(str(src), str(dest))
-
-GEOSERVER_URL = "http://build.geonode.org/geoserver/latest/geoserver.war"
-DATA_DIR_URL = "http://build.geonode.org/geoserver/latest/data.zip"
-JETTY_RUNNER_URL = "http://repo2.maven.org/maven2/org/mortbay/jetty/jetty-runner/8.1.8.v20121106/jetty-runner-8.1.8.v20121106.jar"
+        if str(src).startswith("file://"):
+            src2 = src[7:]
+            if not os.path.exists(src2):
+                print "Source location (%s) does not exist" % str(src2)
+            else:
+                print "Copying local file from %s" % str(src2)
+                shutil.copyfile(str(src2), str(dest))
+        else:
+            urllib.urlretrieve(str(src), str(dest))
 
 
 @task
+@cmdopts([
+    ('geoserver=', 'g', 'The location of the geoserver build (.war file).'),
+    ('jetty=', 'j', 'The location of the Jetty Runner (.jar file).'),
+])
 def setup_geoserver(options):
     """Prepare a testing instance of GeoServer."""
     download_dir = path('downloaded')
@@ -73,11 +89,11 @@ def setup_geoserver(options):
 
     geoserver_dir = path('geoserver')
 
-    geoserver_bin = download_dir / os.path.basename(GEOSERVER_URL)
-    jetty_runner = download_dir / os.path.basename(JETTY_RUNNER_URL)
+    geoserver_bin = download_dir / os.path.basename(dev_config['GEOSERVER_URL'])
+    jetty_runner = download_dir / os.path.basename(dev_config['JETTY_RUNNER_URL'])
 
-    grab(GEOSERVER_URL, geoserver_bin, "geoserver binary")
-    grab(JETTY_RUNNER_URL, jetty_runner, "jetty runner")
+    grab(options.get('geoserver', dev_config['GEOSERVER_URL']), geoserver_bin, "geoserver binary")
+    grab(options.get('jetty', dev_config['JETTY_RUNNER_URL']), jetty_runner, "jetty runner")
 
     if not geoserver_dir.exists():
         geoserver_dir.makedirs()
@@ -113,7 +129,7 @@ def _install_data_dir():
 @task
 def static(options):
     with pushd('geonode/static'):
-        sh('make')
+        sh('grunt production')
 
 
 @task
@@ -129,8 +145,7 @@ def setup(options):
 
 
 def grab_winfiles(url, dest, packagename):
-    #~gohlke needs a user agent that is not python
-    # Add your headers
+    # Add headers
     headers = {'User-Agent': 'Mozilla 5.10'}
     request = urllib2.Request(url, None, headers)
     response = urllib2.urlopen(request)
@@ -142,30 +157,38 @@ def grab_winfiles(url, dest, packagename):
 def win_install_deps(options):
     """
     Install all Windows Binary automatically
+    This can be removed as wheels become available for these packages
     """
     download_dir = path('downloaded').abspath()
     if not download_dir.exists():
         download_dir.makedirs()
     win_packages = {
-        "PIL": "https://pypi.python.org/packages/2.7/P/Pillow/Pillow-2.5.1.win32-py2.7.exe",
-        "Py2exe": "http://superb-dca2.dl.sourceforge.net/project/py2exe/py2exe/0.6.9/py2exe-0.6.9.win32-py2.7.exe",
-        "Nose": "https://s3.amazonaws.com/geonodedeps/nose-1.3.3.win32-py2.7.exe",
-        "LXML": "https://pypi.python.org/packages/2.7/l/lxml/lxml-3.3.5.win32-py2.7.exe",
-        "GDAL": "https://s3.amazonaws.com/geonodedeps/GDAL-1.11.0.win32-py2.7.exe",
-        "PyProj": "https://pyproj.googlecode.com/files/pyproj-1.9.3.win32-py2.7.exe",
-        "Shapely": "https://pypi.python.org/packages/2.7/S/Shapely/Shapely-1.3.0.win32-py2.7.exe",
-        "Psycopg2": "http://www.stickpeople.com/projects/python/win-psycopg/psycopg2-2.4.5.win32-py2.7-pg9.1.3-release.exe"
+        # required by transifex-client
+        "Py2exe": dev_config['WINDOWS']['py2exe'],
+        "Nose": dev_config['WINDOWS']['nose'],
+        # the wheel 1.9.4 installs but pycsw wants 1.9.3, which fails to compile
+        # when pycsw bumps their pyproj to 1.9.4 this can be removed.
+        "PyProj": dev_config['WINDOWS']['pyproj'],
+        "lXML": dev_config['WINDOWS']['lxml']
     }
-
+    failed = False
     for package, url in win_packages.iteritems():
         tempfile = download_dir / os.path.basename(url)
+        print "Installing file ... " + tempfile
         grab_winfiles(url, tempfile, package)
         try:
             easy_install.main([tempfile])
-        except:
-            print "install failed"
+        except Exception, e:
+            failed = True
+            print "install failed with error: ", e
         os.remove(tempfile)
-    print "Windows dependencies now complete.  Run pip install -e geonode --use-mirrors"
+    if failed and sys.maxsize > 2**32:
+        print "64bit architecture is not currently supported"
+        print "try finding the 64 binaries for py2exe, nose, and pyproj"
+    elif failed:
+        print "install failed for py2exe, nose, and/or pyproj"
+    else:
+        print "Windows dependencies now complete.  Run pip install -e geonode --use-mirrors"
 
 
 @cmdopts([
@@ -191,8 +214,15 @@ def sync(options):
     """
     Run the syncdb and migrate management commands to create and migrate a DB
     """
-    sh("python manage.py syncdb --noinput")
-    #sh("python manage.py migrate --noinput")
+    for app in dev_config['MIGRATE_APPS']:
+        try:
+            sh("python manage.py migrate {app} --noinput".format(app=app))
+        except:
+            pass
+    try:
+        sh("python manage.py migrate --noinput")
+    except:
+        pass
     sh("python manage.py loaddata sample_admin.json")
 
 
@@ -201,7 +231,6 @@ def package(options):
     """
     Creates a tarball to use for building the system elsewhere
     """
-    import pkg_resources
     import tarfile
     import geonode
 
@@ -220,7 +249,7 @@ def package(options):
 
     with pushd('package'):
 
-        #Delete old tar files in that directory
+        # Delete old tar files in that directory
         for f in glob.glob('GeoNode*.tar.gz'):
             old_package = path(f)
             if old_package != out_pkg_tar:
@@ -266,7 +295,8 @@ def package(options):
         'start_django'])
 @cmdopts([
     ('bind=', 'b', 'Bind server to provided IP address and port number.'),
-    ('java_path=', 'j', 'Full path to java install for Windows')
+    ('java_path=', 'j', 'Full path to java install for Windows'),
+    ('foreground', 'f', 'Do not run in background but in foreground')
 ], share_with=['start_django', 'start_geoserver'])
 def start():
     """
@@ -296,7 +326,7 @@ def stop():
     """
     Stop GeoNode
     """
-    #windows needs to stop the geoserver first b/c we can't tell which python is running, so we kill everything
+    # windows needs to stop the geoserver first b/c we can't tell which python is running, so we kill everything
     stop_geoserver()
     info("Stopping GeoNode ...")
     stop_django()
@@ -311,7 +341,8 @@ def start_django():
     Start the GeoNode Django application
     """
     bind = options.get('bind', '')
-    sh('python manage.py runserver %s &' % bind)
+    foreground = '' if options.get('foreground', False) else '&'
+    sh('python manage.py runserver %s %s' % (bind, foreground))
 
 
 @cmdopts([
@@ -325,35 +356,56 @@ def start_geoserver(options):
 
     from geonode.settings import OGC_SERVER
     GEOSERVER_BASE_URL = OGC_SERVER['default']['LOCATION']
+    url = GEOSERVER_BASE_URL
 
-    url = "http://localhost:8080/geoserver/"
-    if GEOSERVER_BASE_URL != url:
-        print 'your GEOSERVER_BASE_URL does not match %s' % url
+    if urlparse(GEOSERVER_BASE_URL).hostname != 'localhost':
+        print "Warning: OGC_SERVER['default']['LOCATION'] hostname is not equal to 'localhost'"
+
+    if not GEOSERVER_BASE_URL.endswith('/'):
+        print "Error: OGC_SERVER['default']['LOCATION'] does not end with a '/'"
         sys.exit(1)
 
     download_dir = path('downloaded').abspath()
-    jetty_runner = download_dir / os.path.basename(JETTY_RUNNER_URL)
+    jetty_runner = download_dir / os.path.basename(dev_config['JETTY_RUNNER_URL'])
     data_dir = path('geoserver/data').abspath()
     web_app = path('geoserver/geoserver').abspath()
     log_file = path('geoserver/jetty.log').abspath()
     config = path('scripts/misc/jetty-runner.xml').abspath()
+    jetty_port = urlparse(GEOSERVER_BASE_URL).port
     # @todo - we should not have set workdir to the datadir but a bug in geoserver
     # prevents geonode security from initializing correctly otherwise
     with pushd(data_dir):
         javapath = "java"
-        loggernullpath = "/dev/null"
+        loggernullpath = os.devnull
+
+        # checking if our loggernullpath exists and if not, reset it to something manageable
+        if loggernullpath == "nul":
+            try:
+                open("../../downloaded/null.txt", 'w+').close()
+            except IOError, e:
+                print "Chances are that you have Geoserver currently running.  You \
+                        can either stop all servers with paver stop or start only \
+                        the django application with paver start_django."
+                sys.exit(1)
+            loggernullpath = "../../downloaded/null.txt"
+
         try:
             sh(('java -version'))
         except:
-            if not options.get('java_path', None):
-                print "Paver cannot find java in the Windows Environment.  Please provide the --java_path flag with your full path to java.exe e.g. --java_path=C:/path/to/java/bin/java.exe"
+            print "Java was not found in your path.  Trying some other options: "
+            javapath_opt = None
+            if os.environ.get('JAVA_HOME', None):
+                print "Using the JAVA_HOME environment variable"
+                javapath_opt = os.path.join(os.path.abspath(os.environ['JAVA_HOME']), "bin", "java.exe")
+            elif options.get('java_path'):
+                javapath_opt = options.get('java_path')
+            else:
+                print "Paver cannot find java in the Windows Environment.  \
+                Please provide the --java_path flag with your full path to \
+                java.exe e.g. --java_path=C:/path/to/java/bin/java.exe"
                 sys.exit(1)
             # if there are spaces
-            javapath = 'START /B "" "' + options['java_path'] + '"'
-            # cmd log file needs to exist in windows
-            # using folder from .gitignore
-            open("../../downloaded/null.txt", 'w+').close()
-            loggernullpath = "../../downloaded/null.txt"
+            javapath = 'START /B "" "' + javapath_opt + '"'
 
         sh((
             '%(javapath)s -Xmx512m -XX:MaxPermSize=256m'
@@ -361,6 +413,7 @@ def start_geoserver(options):
             # workaround for JAI sealed jar issue and jetty classloader
             ' -Dorg.eclipse.jetty.server.webapp.parentLoaderPriority=true'
             ' -jar %(jetty_runner)s'
+            ' --port %(jetty_port)i'
             ' --log %(log_file)s'
             ' %(config)s'
             ' > %(loggernullpath)s &' % locals()
@@ -428,6 +481,18 @@ def test_integration(options):
     _reset()
     if not success:
         sys.exit(1)
+
+
+@task
+def run_tests():
+    """
+    Executes the entire test suite.
+    """
+    sh('python manage.py test geonode.tests.smoke')
+    call_task('test')
+    call_task('test_integration')
+    call_task('test_integration', options={'name': 'geonode.tests.csw'})
+    sh('flake8 geonode')
 
 
 @task
@@ -505,16 +570,20 @@ def deb(options):
     with pushd('package'):
 
         # Install requirements
-        #sh('sudo apt-get -y install debhelper devscripts git-buildpackage')
+        # sh('sudo apt-get -y install debhelper devscripts git-buildpackage')
 
         sh(('git-dch --spawn-editor=snapshot --git-author --new-version=%s'
             ' --id-length=6 --ignore-branch --release' % (simple_version)))
+        #In case you publish from Ubuntu Xenial (git-dch is removed from upstream)
+        # use the following line instead:
+        #sh(('gbp dch --spawn-editor=snapshot --git-author --new-version=%s'
+        #    ' --id-length=6 --ignore-branch --release' % (simple_version)))
 
         deb_changelog = path('debian') / 'changelog'
         for line in fileinput.input([deb_changelog], inplace=True):
             print line.replace("urgency=medium", "urgency=high"),
 
-        ## Revert workaround for git-dhc bug
+        # Revert workaround for git-dhc bug
         sh('rm -rf .git')
 
         if key is None and ppa is None:
@@ -555,7 +624,7 @@ def publish():
     sh('git tag debian/%s' % simple_version)
     sh('git push origin debian/%s' % simple_version)
     sh('git push origin master')
-    sh('python setup.py sdist upload')
+    sh('python setup.py sdist upload -r pypi')
 
 
 def versions():
@@ -604,7 +673,7 @@ def kill(arg1, arg2):
 
         running = False
         for line in lines:
-            #this kills all java.exe and python including self in windows
+            # this kills all java.exe and python including self in windows
             if ('%s' % arg2 in line) or (os.name == 'nt' and '%s' % arg1 in line):
                 running = True
 

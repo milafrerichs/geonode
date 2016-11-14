@@ -11,26 +11,46 @@ requirejs.config({
     }
 });
 
-define(['upload/upload','upload/common'], function (upload, common) {
+define(['upload/upload','upload/common', 'upload/LayerInfo'], function (upload, common, LayerInfo) {
     'use strict';
 
     var doTime = function (event) {
         var form = $("#timeForm");
+        $('#next-spinner').removeClass('hide');
+
+        function makeRequest(data) {
+            common.make_request({
+                url: data.redirect_to,
+                async: false,
+                failure: function (resp, status) {
+                    common.logError(resp);
+                    $('#next-spinner').addClass('hide');
+                },
+                success: function (resp, status) {
+                    if (resp.status === "pending") {
+                        setTimeout(function() {
+                            makeRequest(data);
+                        }, 1000);
+                        return;
+                    }
+                    window.location = resp.url;
+                }
+            });
+        };
+
+      var params = common.parseQueryString(document.location.search);
+      var url = '/upload/time'
+      if ('id' in params){
+        url = updateUrl(url, 'id', params.id);
+      }
         $.ajax({
            type: "POST",
-           url: '/upload/time',
+           url: url,
            data: form.serialize(), // serializes the form's elements.
            success: function(data)
            {
                if('redirect_to' in data) {
-                    common.make_request({
-                        url: data.redirect_to,
-                        async: false,
-                        failure: function (resp, status) {common.logError(resp); },
-                        success: function (resp, status) {
-                            window.location = resp.url;
-                        }
-                    });
+                 makeRequest(data);
                 } else if ('url' in data) {
                     window.location = data.url;
                 } else {

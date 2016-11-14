@@ -17,10 +17,9 @@
 <div class="col-md-8">
   <form id="upload_form"  method="post" enctype="multipart/form-data" action="{% url "document_upload" %}">
     <input type="hidden" name="csrfmiddlewaretoken" value="{{ csrf_token }}" />
-    {{ form|as_bootstrap }}
-    <button type="submit" id="upload-button" class="btn btn-danger">Upload</button>
+    {{ form.as_p }}
+    <button type="submit" id="upload-button" class="btn btn-danger">{% trans "Upload" %}</button>
   </form>
-
 </div>
 
 {% endblock %}
@@ -42,7 +41,7 @@
 <script type="text/javascript">
     $('#id_doc_file').on('change', function(){
         if($('#id_title').val() == ''){
-            $('#id_title').val($('#id_doc_file').val());
+            $('#id_title').val($('#id_doc_file').val().replace("C:\\fakepath\\", ""));
         }
     });
     $("#resource").select2({
@@ -64,7 +63,7 @@
                 return {id: object.id, text: object.title};
               })
             }
-          }          
+          }
         }
       });
     $('#upload_form').submit(function(){

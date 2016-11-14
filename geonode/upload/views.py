@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,6 +17,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
 """
 Provide views for doing an upload.
 
@@ -36,6 +38,8 @@ import json
 import logging
 import os
 import traceback
+
+from httplib import BadStatusLine
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
@@ -50,11 +54,11 @@ from geonode.upload import forms, upload, files
 from geonode.upload.forms import LayerUploadForm, UploadFileForm
 from geonode.upload.models import Upload, UploadFile
 from geonode.utils import json_response as do_json_response
-from httplib import BadStatusLine
+from geonode.geoserver.helpers import ogc_server_settings
+
 
 logger = logging.getLogger(__name__)
 
-_SESSION_KEY = 'geonode_upload_session'
 _ALLOW_TIME_STEP = getattr(settings, 'UPLOADER', False)
 if _ALLOW_TIME_STEP:
     _ALLOW_TIME_STEP = _ALLOW_TIME_STEP.get(
@@ -63,7 +67,14 @@ if _ALLOW_TIME_STEP:
         'TIME_ENABLED',
         False)
 
-from geonode.geoserver.helpers import ogc_server_settings
+_ALLOW_MOSAIC_STEP = getattr(settings, 'UPLOADER', False)
+if _ALLOW_MOSAIC_STEP:
+    _ALLOW_MOSAIC_STEP = _ALLOW_MOSAIC_STEP.get(
+        'OPTIONS',
+        False).get(
+        'MOSAIC_ENABLED',
+        False)
+
 _ASYNC_UPLOAD = True if ogc_server_settings and ogc_server_settings.DATASTORE else False
 
 # at the moment, the various time support transformations require the database
@@ -88,11 +99,12 @@ def _is_async_step(upload_session):
     return _ASYNC_UPLOAD and get_next_step(upload_session, offset=2) == 'run'
 
 
-def _progress_redirect(step):
+def _progress_redirect(step, upload_id):
     return json_response(dict(
         success=True,
-        redirect_to=reverse('data_upload', args=[step]),
-        progress=reverse('data_upload_progress')
+        id=upload_id,
+        redirect_to=reverse('data_upload', args=[step]) + "?id=%s" % upload_id,
+        progress=reverse('data_upload_progress') + "?id=%s" % upload_id
     ))
 
 
@@ -108,11 +120,13 @@ class JSONResponse(HttpResponse):
 
     def __init__(self,
                  obj='',
-                 json_opts={},
-                 mimetype="application/json", *args, **kwargs):
+                 json_opts=None,
+                 content_type="application/json", *args, **kwargs):
 
+        if json_opts is None:
+            json_opts = {}
         content = json.dumps(obj, **json_opts)
-        super(JSONResponse, self).__init__(content, mimetype, *args, **kwargs)
+        super(JSONResponse, self).__init__(content, content_type, *args, **kwargs)
 
 
 def _error_response(req, exception=None, errors=None, force_ajax=True):
@@ -123,7 +137,7 @@ def _error_response(req, exception=None, errors=None, force_ajax=True):
     if req.is_ajax() or force_ajax:
         content_type = 'text/html' if not req.is_ajax() else None
         return json_response(exception=exception, errors=errors,
-                             content_type=content_type, status=500)
+                             content_type=content_type, status=400)
     # not sure if any responses will (ideally) ever be non-ajax
     if errors:
         exception = "<br>".join(errors)
@@ -164,7 +178,19 @@ def _next_step_response(req, upload_session, force_ajax=True):
             {'url': url,
              'status': 'incomplete',
              'success': True,
-             'redirect_to': '/upload/time',
+             'id': import_session.id,
+             'redirect_to': '/upload/time' + "?id=%s" % import_session.id,
+             }
+        )
+    if next == 'mosaic' and force_ajax:
+        import_session = upload_session.import_session
+        url = reverse('data_upload') + "?id=%s" % import_session.id
+        return json_response(
+            {'url': url,
+             'status': 'incomplete',
+             'success': True,
+             'id': import_session.id,
+             'redirect_to': '/upload/mosaic' + "?id=%s" % import_session.id,
              }
         )
     if next == 'srs' and force_ajax:
@@ -174,7 +200,8 @@ def _next_step_response(req, upload_session, force_ajax=True):
             {'url': url,
              'status': 'incomplete',
              'success': True,
-             'redirect_to': '/upload/srs',
+             'id': import_session.id,
+             'redirect_to': '/upload/srs' + "?id=%s" % import_session.id,
              }
         )
     if next == 'csv' and force_ajax:
@@ -184,7 +211,8 @@ def _next_step_response(req, upload_session, force_ajax=True):
             {'url': url,
              'status': 'incomplete',
              'success': True,
-             'redirect_to': '/upload/csv',
+             'id': import_session.id,
+             'redirect_to': '/upload/csv' + "?id=%s" % import_session.id,
              }
         )
 
@@ -201,15 +229,16 @@ def _next_step_response(req, upload_session, force_ajax=True):
                                        force_ajax=force_ajax)
     if req.is_ajax() or force_ajax:
         content_type = 'text/html' if not req.is_ajax() else None
-        return json_response(redirect_to=reverse('data_upload', args=[next]),
+        return json_response(redirect_to=reverse('data_upload', args=[next]) + "?id=%s" % req.GET['id'],
                              content_type=content_type)
     # return HttpResponseRedirect(reverse('data_upload', args=[next]))
 
 
 def _create_time_form(import_session, form_data):
     feature_type = import_session.tasks[0].layer
-    filter_type = lambda b: [
-        att.name for att in feature_type.attributes if att.binding == b]
+
+    def filter_type(b):
+        return [att.name for att in feature_type.attributes if att.binding == b]
 
     args = dict(
         time_names=filter_type('java.util.Date'),
@@ -251,7 +280,18 @@ def save_step_view(req, session):
             req.user,
             name,
             base_file,
-            overwrite=False)
+            overwrite=False,
+            mosaic=form.cleaned_data['mosaic'],
+            append_to_mosaic_opts=form.cleaned_data['append_to_mosaic_opts'],
+            append_to_mosaic_name=form.cleaned_data['append_to_mosaic_name'],
+            mosaic_time_regex=form.cleaned_data['mosaic_time_regex'],
+            mosaic_time_value=form.cleaned_data['mosaic_time_value'],
+            time_presentation=form.cleaned_data['time_presentation'],
+            time_presentation_res=form.cleaned_data['time_presentation_res'],
+            time_presentation_default_value=form.cleaned_data['time_presentation_default_value'],
+            time_presentation_reference_value=form.cleaned_data['time_presentation_reference_value']
+        )
+
         sld = None
 
         if base_file[0].sld_files:
@@ -259,7 +299,7 @@ def save_step_view(req, session):
 
         logger.info('provided sld is %s' % sld)
         # upload_type = get_upload_type(base_file)
-        upload_session = req.session[_SESSION_KEY] = upload.UploaderSession(
+        upload_session = upload.UploaderSession(
             tempdir=tempdir,
             base_file=base_file,
             name=name,
@@ -269,10 +309,17 @@ def save_step_view(req, session):
             permissions=form.cleaned_data["permissions"],
             import_sld_file=sld,
             upload_type=base_file[0].file_type.code,
-            geogit=form.cleaned_data['geogit'],
-            geogit_store=form.cleaned_data['geogit_store'],
-            time=form.cleaned_data['time']
+            geogig=form.cleaned_data['geogig'],
+            geogig_store=form.cleaned_data['geogig_store'],
+            time=form.cleaned_data['time'],
+            mosaic=form.cleaned_data['mosaic'],
+            append_to_mosaic_opts=form.cleaned_data['append_to_mosaic_opts'],
+            append_to_mosaic_name=form.cleaned_data['append_to_mosaic_name'],
+            mosaic_time_regex=form.cleaned_data['mosaic_time_regex'],
+            mosaic_time_value=form.cleaned_data['mosaic_time_value'],
+            user=req.user
         )
+        req.session[str(upload_session.import_session.id)] = upload_session
         return _next_step_response(req, upload_session, force_ajax=True)
     else:
         errors = []
@@ -284,8 +331,14 @@ def save_step_view(req, session):
 def data_upload_progress(req):
     """This would not be needed if geoserver REST did not require admin role
     and is an inefficient way of getting this information"""
-    if _SESSION_KEY in req.session:
-        upload_session = req.session[_SESSION_KEY]
+    if 'id' in req.GET:
+        upload_id = str(req.GET['id'])
+        if upload_id in req.session:
+            upload_obj = get_object_or_404(Upload, import_id=upload_id, user=req.user)
+            upload_session = upload_obj.get_session()
+        else:
+            upload_session = req.session[upload_id]
+
         import_session = upload_session.import_session
         progress = import_session.tasks[0].get_progress()
         return json_response(progress)
@@ -360,8 +413,8 @@ def csv_step_view(request, upload_session):
     if request.method == 'POST':
         if not lat_field or not lng_field:
             error = 'Please choose which columns contain the latitude and longitude data.'
-        elif (lat_field not in point_candidates
-              or lng_field not in point_candidates):
+        elif (lat_field not in point_candidates or
+              lng_field not in point_candidates):
             error = 'Invalid latitude/longitude columns'
         elif lat_field == lng_field:
             error = 'You cannot select the same column for latitude and longitude data.'
@@ -449,8 +502,12 @@ def time_step_view(request, upload_session):
     start_attribute_and_type = cleaned.get('start_attribute', None)
 
     if start_attribute_and_type:
-        tx = lambda type_name: None if type_name is None or type_name == 'Date' \
-            else 'DateFormatTransform'
+
+        def tx(type_name):
+
+            return None if type_name is None or type_name == 'Date' \
+                else 'DateFormatTransform'
+
         end_attribute, end_type = cleaned.get('end_attribute', (None, None))
         upload.time_step(
             upload_session,
@@ -478,13 +535,21 @@ def run_response(req, upload_session):
 
     if _ASYNC_UPLOAD:
         next = get_next_step(upload_session)
-        return _progress_redirect(next)
+        return _progress_redirect(next, upload_session.import_session.id)
 
     return _next_step_response(req, upload_session)
 
 
 def final_step_view(req, upload_session):
-    saved_layer = upload.final_step(upload_session, req.user)
+    try:
+        saved_layer = upload.final_step(upload_session, req.user)
+
+    except upload.LayerNotReady:
+        return json_response({'status': 'pending',
+                              'success': True,
+                              'id': req.GET['id'],
+                              'redirect_to': '/upload/final' + "?id=%s" % req.GET['id']})
+
     # this response is different then all of the other views in the
     # upload as it does not return a response as a json object
     return json_response(
@@ -505,9 +570,24 @@ _steps = {
 # and 'save' is the implied first step :P
 _pages = {
     'shp': ('srs', 'time', 'run', 'final'),
-    'tif': ('time', 'run', 'final'),
+    'tif': ('run', 'final'),
     'kml': ('run', 'final'),
     'csv': ('csv', 'time', 'run', 'final'),
+    'geojson': ('run', 'final'),
+    'ntf': ('run', 'final'),  # NITF
+    'img': ('run', 'final'),  # ERDAS Imagine
+    'i41': ('run', 'final'),  # CIB01 RPF
+    'i21': ('run', 'final'),  # CIB05 RPF
+    'i11': ('run', 'final'),  # CIB10 RPF
+    'gn1': ('run', 'final'),  # GNC RPF
+    'jn1': ('run', 'final'),  # JNC RPF
+    'on1': ('run', 'final'),  # ONC RPF
+    'tp1': ('run', 'final'),  # TPC RPF
+    'ja1': ('run', 'final'),  # JOG RPF
+    'tc1': ('run', 'final'),  # TLM100 RPF
+    'tl1': ('run', 'final'),  # TLM50 RPF
+    'jp2': ('run', 'final'),  # JPEG2000 MrSID
+    'sid': ('run', 'final'),  # MrSID
 }
 
 if not _ALLOW_TIME_STEP:
@@ -515,6 +595,20 @@ if not _ALLOW_TIME_STEP:
         steps = list(steps)
         if 'time' in steps:
             steps.remove('time')
+        _pages[t] = tuple(steps)
+
+if not _ALLOW_MOSAIC_STEP:
+    for t, steps in _pages.items():
+        steps = list(steps)
+        if 'mosaic' in steps:
+            steps.remove('mosaic')
+        _pages[t] = tuple(steps)
+
+if not _ALLOW_MOSAIC_STEP:
+    for t, steps in _pages.items():
+        steps = list(steps)
+        if 'mosaic' in steps:
+            steps.remove('mosaic')
         _pages[t] = tuple(steps)
 
 
@@ -550,33 +644,39 @@ def advance_step(req, upload_session):
 def view(req, step):
     """Main uploader view"""
     upload_session = None
-
+    upload_id = req.GET.get('id', None)
     if step is None:
-        if 'id' in req.GET:
+        if upload_id:
             # upload recovery
             upload_obj = get_object_or_404(
                 Upload,
-                import_id=req.GET['id'],
+                import_id=upload_id,
                 user=req.user)
             session = upload_obj.get_session()
             if session:
-                req.session[_SESSION_KEY] = session
+                req.session[upload_id] = session
                 return _next_step_response(req, session)
 
         step = 'save'
 
         # delete existing session
-        if _SESSION_KEY in req.session:
-            del req.session[_SESSION_KEY]
+        if upload_id and upload_id in req.session:
+            del req.session[upload_id]
 
     else:
-        if _SESSION_KEY not in req.session:
+        if not upload_id:
             return render_to_response(
                 "upload/layer_upload_invalid.html",
                 RequestContext(
                     req,
                     {}))
-        upload_session = req.session[_SESSION_KEY]
+
+        upload_obj = get_object_or_404(Upload, import_id=upload_id, user=req.user)
+        session = upload_obj.get_session()
+        if session:
+            upload_session = session
+        else:
+            upload_session = req.session[upload_id]
 
     try:
         if req.method == 'GET' and upload_session:
@@ -591,14 +691,22 @@ def view(req, step):
         # must be put back to update object in session
         if upload_session:
             if step == 'final':
-                # we're done with this session, wax it
-                Upload.objects.update_from_session(upload_session)
-                upload_session = None
-                del req.session[_SESSION_KEY]
+                delete_session = True
+                try:
+                    resp_js = json.loads(resp.content)
+                    delete_session = resp_js.get('status') != 'pending'
+                except:
+                    pass
+
+                if delete_session:
+                    # we're done with this session, wax it
+                    Upload.objects.update_from_session(upload_session)
+                    upload_session = None
+                    del req.session[upload_id]
             else:
-                req.session[_SESSION_KEY] = upload_session
-        elif _SESSION_KEY in req.session:
-            upload_session = req.session[_SESSION_KEY]
+                req.session[upload_id] = upload_session
+        elif upload_id in req.session:
+            upload_session = req.session[upload_id]
         if upload_session:
             Upload.objects.update_from_session(upload_session)
         return resp
@@ -655,18 +763,18 @@ class UploadFileCreateView(CreateView):
                     args=[
                         self.object.id]),
                 'delete_type': "DELETE"}]
-        response = JSONResponse(data, {}, response_mimetype(self.request))
+        response = JSONResponse(data, {}, response_content_type(self.request))
         response['Content-Disposition'] = 'inline; filename=files.json'
         return response
 
     def form_invalid(self, form):
         data = [{}]
-        response = JSONResponse(data, {}, response_mimetype(self.request))
+        response = JSONResponse(data, {}, response_content_type(self.request))
         response['Content-Disposition'] = 'inline; filename=files.json'
         return response
 
 
-def response_mimetype(request):
+def response_content_type(request):
     if "application/json" in request.META['HTTP_ACCEPT']:
         return "application/json"
     else:
@@ -684,7 +792,7 @@ class UploadFileDeleteView(DeleteView):
         self.object = self.get_object()
         self.object.delete()
         if request.is_ajax():
-            response = JSONResponse(True, {}, response_mimetype(self.request))
+            response = JSONResponse(True, {}, response_content_type(self.request))
             response['Content-Disposition'] = 'inline; filename=files.json'
             return response
         else:

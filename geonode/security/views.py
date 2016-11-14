@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,18 +18,21 @@
 #
 #########################################################################
 
-from django.utils import simplejson as json
+try:
+    import json
+except ImportError:
+    from django.utils import simplejson as json
 from django.core.exceptions import PermissionDenied
 from django.http import HttpResponse
 from django.views.decorators.http import require_POST
 from django.shortcuts import get_object_or_404
 from django.conf import settings
 
-if "notification" in settings.INSTALLED_APPS:
-    from notification import models as notification
-
 from geonode.utils import resolve_object
 from geonode.base.models import ResourceBase
+
+if "notification" in settings.INSTALLED_APPS:
+    from notification import models as notification
 
 
 def _perms_info(obj):
@@ -59,30 +62,51 @@ def resource_permissions(request, resource_id):
         return HttpResponse(
             'You are not allowed to change permissions for this resource',
             status=401,
-            mimetype='text/plain')
+            content_type='text/plain')
 
     if request.method == 'POST':
-        permission_spec = json.loads(request.body)
-        resource.set_permissions(permission_spec)
+        success = True
+        message = "Permissions successfully updated!"
+        try:
+            permission_spec = json.loads(request.body)
+            resource.set_permissions(permission_spec)
 
-        return HttpResponse(
-            json.dumps({'success': True}),
-            status=200,
-            mimetype='text/plain'
-        )
+            # Check Users Permissions Consistency
+            info = _perms_info(resource)
+            info_users = dict([(u.username, perms) for u, perms in info['users'].items()])
+            for user, perms in info_users.items():
+                if 'download_resourcebase' in perms and 'view_resourcebase' not in perms:
+                    success = False
+                    message = 'User ' + str(user) + ' has Download permissions but ' \
+                              'cannot access the resource. ' \
+                              'Please update permissions consistently!'
+
+            return HttpResponse(
+                json.dumps({'success': success, 'message': message}),
+                status=200,
+                content_type='text/plain'
+            )
+        except:
+            success = False
+            message = "Error updating permissions :("
+            return HttpResponse(
+                json.dumps({'success': success, 'message': message}),
+                status=500,
+                content_type='text/plain'
+            )
 
     elif request.method == 'GET':
         permission_spec = _perms_info_json(resource)
         return HttpResponse(
             json.dumps({'success': True, 'permissions': permission_spec}),
             status=200,
-            mimetype='text/plain'
+            content_type='text/plain'
         )
     else:
         return HttpResponse(
             'No methods other than get and post are allowed',
             status=401,
-            mimetype='text/plain')
+            content_type='text/plain')
 
 
 @require_POST
@@ -106,13 +130,13 @@ def set_bulk_permissions(request):
         return HttpResponse(
             json.dumps({'success': 'ok', 'not_changed': not_permitted}),
             status=200,
-            mimetype='text/plain'
+            content_type='text/plain'
         )
     else:
         return HttpResponse(
             json.dumps({'error': 'Wrong permissions specification'}),
             status=400,
-            mimetype='text/plain')
+            content_type='text/plain')
 
 
 @require_POST
@@ -130,9 +154,9 @@ def request_permissions(request):
         return HttpResponse(
             json.dumps({'success': 'ok', }),
             status=200,
-            mimetype='text/plain')
+            content_type='text/plain')
     except:
         return HttpResponse(
             json.dumps({'error': 'error delivering notification'}),
             status=400,
-            mimetype='text/plain')
+            content_type='text/plain')

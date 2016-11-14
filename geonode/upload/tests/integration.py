@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 #########################################################################
 #
-# Copyright (C) 2012 OpenPlans
+# Copyright (C) 2016 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,6 +17,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
 """
 See the README.rst in this directory for details on running these tests.
 @todo allow using a database other than `development.db` - for some reason, a
@@ -34,6 +36,10 @@ from geonode.upload.models import Upload
 from geonode.upload.views import _ALLOW_TIME_STEP
 from geonode.geoserver.helpers import ogc_server_settings
 from geonode.geoserver.helpers import cascading_delete
+from geonode.layers.utils import file_upload
+from geonode.tests.utils import check_layer
+from geonode.geoserver.helpers import get_time_info, set_time_info
+from geonode.geoserver.signals import gs_catalog
 from geoserver.catalog import Catalog
 from gisdata import BAD_DATA
 from gisdata import GOOD_DATA
@@ -53,6 +59,8 @@ import unittest
 import urllib
 import urllib2
 from zipfile import ZipFile
+import re
+from geonode.upload.utils import make_geogig_rest_payload
 
 GEONODE_USER = 'test_uploader'
 GEONODE_PASSWD = 'test_uploader'
@@ -431,7 +439,7 @@ class UploaderBase(unittest.TestCase):
         h2 = soup.find_all(['h2'])[0]
         self.assertTrue(str(h2).find(layer_name))
 
-    def upload_folder_of_files(self, folder, final_check):
+    def upload_folder_of_files(self, folder, final_check, session_ids=None):
 
         mains = ('.tif', '.shp', '.zip')
 
@@ -445,13 +453,23 @@ class UploaderBase(unittest.TestCase):
             _file = os.path.join(folder, main)
             base, _ = os.path.splitext(_file)
             resp, data = self.client.upload_file(_file)
+            if session_ids is not None:
+                if data.get('url'):
+                    session_id = re.search(r'.*id=(\d+)', data.get('url')).group(1)
+                    if session_id:
+                        session_ids += [session_id]
             self.wait_for_progress(data.get('progress'))
             final_check(base, resp, data)
 
-    def upload_file(self, fname, final_check, check_name=None):
+    def upload_file(self, fname, final_check, check_name=None, session_ids=None):
         if not check_name:
             check_name, _ = os.path.splitext(fname)
         resp, data = self.client.upload_file(fname)
+        if session_ids is not None:
+            if data.get('url'):
+                session_id = re.search(r'.*id=(\d+)', data.get('url')).group(1)
+                if session_id:
+                    session_ids += [session_id]
         self.wait_for_progress(data.get('progress'))
         final_check(check_name, resp, data)
 
@@ -520,6 +538,27 @@ class TestUpload(UploaderBase):
         self.upload_folder_of_files(
             invalid_path,
             self.check_invalid_projection)
+
+    def test_coherent_importer_session(self):
+        """ Tests that the upload computes correctly next session IDs"""
+        session_ids = []
+
+        # First of all lets upload a raster
+        fname = os.path.join(GOOD_DATA, 'raster', 'relief_san_andres.tif')
+        self.upload_file(fname, self.complete_raster_upload, session_ids=session_ids)
+
+        # Next force an invalid session
+        invalid_path = os.path.join(BAD_DATA)
+        self.upload_folder_of_files(
+            invalid_path,
+            self.check_invalid_projection, session_ids=session_ids)
+
+        # Finally try to upload a good file anc check the session IDs
+        fname = os.path.join(GOOD_DATA, 'raster', 'relief_san_andres.tif')
+        self.upload_file(fname, self.complete_raster_upload, session_ids=session_ids)
+
+        self.assertTrue(len(session_ids) > 1)
+        self.assertTrue(int(session_ids[0]) < int(session_ids[1]))
 
     def test_extension_not_implemented(self):
         """Verify a error message is return when an unsupported layer is
@@ -622,3 +661,94 @@ class TestUploadDBDataStore(UploaderBase):
         wms = get_wms(type_name='geonode:%s' % layer_name)
         layer_info = wms.items()[0][1]
         self.assertEquals(100, len(layer_info.timepositions))
+
+    def test_configure_time(self):
+        # make sure it's not there (and configured)
+        cascading_delete(gs_catalog, 'boxes_with_end_date')
+
+        def get_wms_timepositions():
+            metadata = get_wms().contents['geonode:boxes_with_end_date']
+            self.assertTrue(metadata is not None)
+            return metadata.timepositions
+
+        thefile = os.path.join(
+            GOOD_DATA, 'time', 'boxes_with_end_date.shp'
+        )
+        uploaded = file_upload(thefile, overwrite=True)
+        check_layer(uploaded)
+        # initial state is no positions or info
+        self.assertTrue(get_wms_timepositions() is None)
+        self.assertTrue(get_time_info(uploaded) is None)
+
+        # enable using interval and single attribute
+        set_time_info(uploaded, 'date', None, 'DISCRETE_INTERVAL', 3, 'days')
+        self.assertEquals(
+            ['2000-03-01T00:00:00.000Z/2000-06-08T00:00:00.000Z/P3D'],
+            get_wms_timepositions()
+        )
+        self.assertEquals(
+            {'end_attribute': None, 'presentation': 'DISCRETE_INTERVAL',
+             'attribute': 'date', 'enabled': True, 'precision_value': '3',
+             'precision_step': 'days'},
+            get_time_info(uploaded)
+        )
+
+        # disable but configure to use enddate attribute in list
+        set_time_info(uploaded, 'date', 'enddate', 'LIST', None, None, enabled=False)
+        # verify disabled
+        self.assertTrue(get_wms_timepositions() is None)
+        # test enabling now
+        info = get_time_info(uploaded)
+        info['enabled'] = True
+        set_time_info(uploaded, **info)
+        self.assertEquals(100, len(get_wms_timepositions()))
+
+
+class GeogigTest(unittest.TestCase):
+
+    def test_payload_creation(self):
+        '''Test formation of REST call to geoserver's geogig API'''
+        author_name = "test"
+        author_email = "testuser@geonode.org"
+
+        # Test filebased geogig
+        settings.OGC_SERVER['default']['PG_GEOGIG'] = False
+        fb_message = {
+            "authorName": author_name,
+            "authorEmail": author_email,
+            "parentDirectory":
+            settings.OGC_SERVER['default']['GEOGIG_DATASTORE_DIR']
+        }
+        fb_payload = make_geogig_rest_payload(author_name, author_email)
+        self.assertDictEqual(fb_message, fb_payload)
+        self.assertEquals(json.dumps(fb_message, sort_keys=True),
+                          json.dumps(fb_payload, sort_keys=True))
+
+        # Test postgres based geogig
+        settings.OGC_SERVER['default']['PG_GEOGIG'] = True
+        # Manually override the settings to simulate the REST call for postgres
+        settings.DATABASES['test-pg'] = {
+            "HOST": "localhost",
+            "PORT": "5432",
+            "NAME": "repos",
+            "SCHEMA": "public",
+            "USER": "geogig",
+            "PASSWORD": "geogig"
+        }
+        settings.OGC_SERVER['default']['DATASTORE'] = 'test-pg'
+
+        pg_message = {
+            "authorName": author_name,
+            "authorEmail": author_email,
+            "dbHost": settings.DATABASES['test-pg']['HOST'],
+            "dbPort": settings.DATABASES['test-pg']['PORT'],
+            "dbName": settings.DATABASES['test-pg']['NAME'],
+            "dbSchema": settings.DATABASES['test-pg']['SCHEMA'],
+            "dbUser": settings.DATABASES['test-pg']['USER'],
+            "dbPassword": settings.DATABASES['test-pg']['PASSWORD']
+        }
+
+        pg_payload = make_geogig_rest_payload(author_name, author_email)
+        self.assertDictEqual(pg_message, pg_payload)
+        self.assertEquals(json.dumps(pg_message, sort_keys=True),
+                          json.dumps(pg_payload, sort_keys=True))

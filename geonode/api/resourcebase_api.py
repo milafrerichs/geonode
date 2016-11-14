@@ -1,3 +1,23 @@
+# -*- coding: utf-8 -*-
+#########################################################################
+#
+# Copyright (C) 2016 OSGeo
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+#########################################################################
+
 import re
 from django.db.models import Q
 from django.http import HttpResponse
@@ -13,20 +33,24 @@ from guardian.shortcuts import get_objects_for_user
 from django.conf.urls import url
 from django.core.paginator import Paginator, InvalidPage
 from django.http import Http404
+from django.core.exceptions import ObjectDoesNotExist
 
 from tastypie.utils.mime import build_content_type
-if settings.HAYSTACK_SEARCH:
-    from haystack.query import SearchQuerySet  # noqa
 
 from geonode.layers.models import Layer
 from geonode.maps.models import Map
 from geonode.documents.models import Document
 from geonode.base.models import ResourceBase
+from geonode.base.models import HierarchicalKeyword
 
 from .authorization import GeoNodeAuthorization
 
-from .api import TagResource, ProfileResource, TopicCategoryResource, \
+from .api import TagResource, RegionResource, ProfileResource, \
+    TopicCategoryResource, \
     FILTER_TYPES
+
+if settings.HAYSTACK_SEARCH:
+    from haystack.query import SearchQuerySet  # noqa
 
 LAYER_SUBTYPES = {
     'vector': 'dataStore',
@@ -41,6 +65,7 @@ class CommonMetaApi:
     allowed_methods = ['get']
     filtering = {'title': ALL,
                  'keywords': ALL_WITH_RELATIONS,
+                 'regions': ALL_WITH_RELATIONS,
                  'category': ALL_WITH_RELATIONS,
                  'owner': ALL_WITH_RELATIONS,
                  'date': ALL,
@@ -51,6 +76,7 @@ class CommonMetaApi:
 
 class CommonModelApi(ModelResource):
     keywords = fields.ToManyField(TagResource, 'keywords', null=True)
+    regions = fields.ToManyField(RegionResource, 'regions', null=True)
     category = fields.ToOneField(
         TopicCategoryResource,
         'category',
@@ -58,7 +84,9 @@ class CommonModelApi(ModelResource):
         full=True)
     owner = fields.ToOneField(ProfileResource, 'owner', full=True)
 
-    def build_filters(self, filters={}):
+    def build_filters(self, filters=None):
+        if filters is None:
+            filters = {}
         orm_filters = super(CommonModelApi, self).build_filters(filters)
         if 'type__in' in filters and filters[
                 'type__in'] in FILTER_TYPES.keys():
@@ -75,6 +103,7 @@ class CommonModelApi(ModelResource):
     def apply_filters(self, request, applicable_filters):
         types = applicable_filters.pop('type', None)
         extent = applicable_filters.pop('extent', None)
+        keywords = applicable_filters.pop('keywords__slug__in', None)
         semi_filtered = super(
             CommonModelApi,
             self).apply_filters(
@@ -102,6 +131,24 @@ class CommonModelApi(ModelResource):
 
         if extent:
             filtered = self.filter_bbox(filtered, extent)
+
+        if keywords:
+            filtered = self.filter_h_keywords(filtered, keywords)
+
+        return filtered
+
+    def filter_h_keywords(self, queryset, keywords):
+        filtered = queryset
+        treeqs = HierarchicalKeyword.objects.none()
+        for keyword in keywords:
+            try:
+                kw = HierarchicalKeyword.objects.get(name=keyword)
+                treeqs = treeqs | HierarchicalKeyword.get_tree(kw)
+            except ObjectDoesNotExist:
+                # Ignore keywords not actually used?
+                pass
+
+        filtered = queryset.filter(Q(keywords__in=treeqs))
         return filtered
 
     def filter_bbox(self, queryset, bbox):
@@ -142,13 +189,20 @@ class CommonModelApi(ModelResource):
             type_facets.append(resource_filter)
 
         # Publication date range (start,end)
-        date_range = parameters.get("date_range", ",").split(",")
+        date_end = parameters.get("date__lte", None)
+        date_start = parameters.get("date__gte", None)
 
         # Topic category filter
         category = parameters.getlist("category__identifier__in")
 
         # Keyword filter
         keywords = parameters.getlist("keywords__slug__in")
+
+        # Region filter
+        regions = parameters.getlist("regions__name__in")
+
+        # Owner filters
+        owner = parameters.getlist("owner__username__in")
 
         # Sort order
         sort = parameters.get("order_by", "relevance")
@@ -234,15 +288,31 @@ class CommonModelApi(ModelResource):
                     SearchQuerySet() if sqs is None else sqs).filter_or(
                     keywords_exact=keyword)
 
+        # filter by regions: use filter_or with regions_exact
+        # not using exact leads to fuzzy matching and too many results
+        # using narrow with exact leads to zero results if multiple keywords
+        # selected
+        if regions:
+            for region in regions:
+                sqs = (
+                    SearchQuerySet() if sqs is None else sqs).filter_or(
+                    regions_exact__exact=region)
+
+        # filter by owner
+        if owner:
+            sqs = (
+                SearchQuerySet() if sqs is None else sqs).narrow(
+                    "owner__username:%s" % ','.join(map(str, owner)))
+
         # filter by date
-        if date_range[0]:
+        if date_start:
             sqs = (SearchQuerySet() if sqs is None else sqs).filter(
-                SQ(date__gte=date_range[0])
+                SQ(date__gte=date_start)
             )
 
-        if date_range[1]:
+        if date_end:
             sqs = (SearchQuerySet() if sqs is None else sqs).filter(
-                SQ(date__lte=date_range[1])
+                SQ(date__lte=date_end)
             )
 
         # Filter by geographic bounding box
@@ -259,10 +329,10 @@ class CommonModelApi(ModelResource):
         # Apply sort
         if sort.lower() == "-date":
             sqs = (
-                SearchQuerySet() if sqs is None else sqs).order_by("-modified")
+                SearchQuerySet() if sqs is None else sqs).order_by("-date")
         elif sort.lower() == "date":
             sqs = (
-                SearchQuerySet() if sqs is None else sqs).order_by("modified")
+                SearchQuerySet() if sqs is None else sqs).order_by("date")
         elif sort.lower() == "title":
             sqs = (SearchQuerySet() if sqs is None else sqs).order_by(
                 "title_sortable")
@@ -274,7 +344,7 @@ class CommonModelApi(ModelResource):
                 "-popular_count")
         else:
             sqs = (
-                SearchQuerySet() if sqs is None else sqs).order_by("-modified")
+                SearchQuerySet() if sqs is None else sqs).order_by("-date")
 
         return sqs
 
@@ -288,26 +358,21 @@ class CommonModelApi(ModelResource):
 
         if not settings.SKIP_PERMS_FILTER:
             # Get the list of objects the user has access to
-            filter_set = set(
-                get_objects_for_user(
-                    request.user,
-                    'base.view_resourcebase'
-                )
-            )
+            filter_set = get_objects_for_user(request.user, 'base.view_resourcebase')
             if settings.RESOURCE_PUBLISHING:
                 filter_set = filter_set.filter(is_published=True)
 
-            filter_set_ids = filter_set.values_list('id', flat=True)
+            filter_set_ids = filter_set.values_list('id')
             # Do the query using the filterset and the query term. Facet the
             # results
             if len(filter_set) > 0:
-                sqs = sqs.filter(oid__in=filter_set_ids).facet('type').facet('subtype').facet('owner').facet('keywords')\
-                    .facet('category')
+                sqs = sqs.filter(id__in=filter_set_ids).facet('type').facet('subtype').facet('owner')\
+                    .facet('keywords').facet('regions').facet('category')
             else:
                 sqs = None
         else:
             sqs = sqs.facet('type').facet('subtype').facet(
-                'owner').facet('keywords').facet('category')
+                'owner').facet('keywords').facet('regions').facet('category')
 
         if sqs:
             # Build the Facet dict
@@ -352,10 +417,15 @@ class CommonModelApi(ModelResource):
                     "total_count": total_count,
                     "facets": facets,
                     },
-            'objects': map(lambda x: x.get_stored_fields(), objects),
+            'objects': map(lambda x: self.get_haystack_api_fields(x), objects),
         }
         self.log_throttled_access(request)
         return self.create_response(request, object_list)
+
+    def get_haystack_api_fields(self, haystack_object):
+        object_fields = dict((k, v) for k, v in haystack_object.get_stored_fields().items()
+                             if not re.search('_exact$|_sortable$', k))
+        return object_fields
 
     def get_list(self, request, **kwargs):
         """
@@ -386,13 +456,15 @@ class CommonModelApi(ModelResource):
         to_be_serialized = self.alter_list_data_to_serialize(
             request,
             to_be_serialized)
-        return self.create_response(request, to_be_serialized)
+
+        return self.create_response(request, to_be_serialized, response_objects=objects)
 
     def create_response(
             self,
             request,
             data,
             response_class=HttpResponse,
+            response_objects=None,
             **response_kwargs):
         """
         Extracts the common "which-format/serialize/return-response" cycle.
@@ -408,8 +480,6 @@ class CommonModelApi(ModelResource):
             'abstract',
             'csw_wkt_geometry',
             'csw_type',
-            'distribution_description',
-            'distribution_url',
             'owner__username',
             'share_count',
             'popular_count',
@@ -421,12 +491,19 @@ class CommonModelApi(ModelResource):
             'rating',
         ]
 
+        # If an user does not have at least view permissions, he won't be able to see the resource at all.
+        if response_objects:
+            filtered_objects_ids = [item.id for item in response_objects if
+                                    request.user.has_perm('view_resourcebase', item.get_self_resource())]
         if isinstance(
                 data,
                 dict) and 'objects' in data and not isinstance(
                 data['objects'],
                 list):
-            data['objects'] = list(data['objects'].values(*VALUES))
+            if filtered_objects_ids:
+                data['objects'] = [x for x in list(data['objects'].values(*VALUES)) if x['id'] in filtered_objects_ids]
+            else:
+                data['objects'] = list(data['objects'].values(*VALUES))
 
         desired_format = self.determine_format(request)
         serialized = self.serialize(request, data, desired_format)
