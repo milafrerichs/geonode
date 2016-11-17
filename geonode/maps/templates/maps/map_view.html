@@ -6,8 +6,10 @@
 
 {% block head %}
 {{ block.super }}
-{% include 'maps/map_geoexplorer.js' %}
+{% include 'maps/map_react.html' %}
 
 {% endblock %}
-
+{% block body %}
+  <div id="map"></div>
+{% endblock %}
 {% block footer %}{% endblock %}
