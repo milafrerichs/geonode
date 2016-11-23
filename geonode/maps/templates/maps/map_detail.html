@@ -20,7 +20,7 @@
   {% elif preview == 'leaflet' %}
     {% include "maps/map_leaflet.html" %}
   {% else %}
-    {% include "maps/map_include.html" %}
+    {% include "maps/map_react_detail.html" %}
   {% endif %}
   {{ block.super }}
 {% endblock %}
