@@ -43,7 +43,7 @@ Ext.onReady(function() {
         csrfToken: "{{ csrf_token }}",
         tools: [{ptype: "gxp_getfeedfeatureinfo"}],
     }, {{ viewer }});
-    var viewer = new Viewer('preview_map', config);
+    var viewer = new this.viewer('preview_map', config);
     viewer.view();
 {% endautoescape %}
 });
