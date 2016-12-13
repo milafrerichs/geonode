@@ -1,7 +1,13 @@
 {% include 'geonode/ext_header.html' %}
 {% include 'geonode/geo_header.html' %}
-<script type="text/javascript" src="{{ STATIC_URL}}geonode/js/react-viewer/viewer.min.js"></script>
-<script type="text/javascript" src="{{ STATIC_URL}}geonode/js/react-viewer/ol3-cesium/Cesium.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL}}geonode-client/js/viewer.min.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL}}geonode-client/cesium/Cesium.js"></script>
+<style>
+	#content {
+		position: relative;
+		margin-top: 50px;
+	}
+</style>
 
 <script type="text/javascript">
 Ext.onReady(function() {
