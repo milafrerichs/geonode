@@ -22,7 +22,7 @@
   {% elif preview == 'react' %}
 		{% include 'geonode-client/map_detail.html' %}
   {% else %}
-    {% include "maps/map_react_detail.html" %}
+    {% include "maps/map_include.html" %}
   {% endif %}
   {{ block.super }}
 {% endblock %}

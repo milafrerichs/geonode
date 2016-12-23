@@ -31,7 +31,7 @@ services:
       - ./scripts/docker/env/production/django.env
 
   geoserver:
-    image: kartoza/geoserver
+    image: geonode/geoserver
     links:
       - postgres
     ports:
